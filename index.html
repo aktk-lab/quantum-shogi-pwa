@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>量子将棋（PWA版）</title>
+  <meta name="theme-color" content="#111827" />
+  <link rel="manifest" href="./manifest.webmanifest">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- React + Babel + Tailwind（初回だけ通信が必要） -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>html,body,#root{height:100%}body{background:#0b1020}</style>
+</head>
+<body class="bg-neutral-50 text-neutral-900">
+  <div id="root"></div>
+  <noscript>JavaScriptを有効にしてください</noscript>
+
+  <!-- 量子将棋（本体） -->
+  <script type="text/babel">
+    const { useState } = React;
+
+    const inside = (f, r) => f >= 0 && f < 9 && r >= 0 && r < 9;
+    const sqEq = (a, b) => !!a && !!b && a.f === b.f && a.r === b.r;
+    const deepCopy = (x) => JSON.parse(JSON.stringify(x));
+    const QE_KINDS = ["R","B","G"];
+    const dir = (side) => side === "Sente" ? 1 : -1;
+    const inPromoZone = (side, r) => side === "Sente" ? r >= 6 : r <= 2;
+    const emptyBoard = () => Array.from({length:9},()=>Array.from({length:9},()=>({})));
+    let nextId = 1;
+    const nid = () => `p${nextId++}`;
+
+    const place = (board, pieces, side, kind, f, r, promoted=false) => {
+      const id = nid();
+      pieces[id] = { id, side, kind, promoted, quantum: { status:"none", origin:{f,r}, branches:[{f,r},{f,r}] } };
+      board[r][f].pieceId = id;
+    };
+
+    const setupInitial = () => {
+      const board = emptyBoard(); const pieces = {};
+      // Sente
+      place(board,pieces,"Sente","L",0,8); place(board,pieces,"Sente","N",1,8); place(board,pieces,"Sente","S",2,8);
+      place(board,pieces,"Sente","G",3,8); place(board,pieces,"Sente","K",4,8); place(board,pieces,"Sente","G",5,8);
+      place(board,pieces,"Sente","S",6,8); place(board,pieces,"Sente","N",7,8); place(board,pieces,"Sente","L",8,8);
+      place(board,pieces,"Sente","B",1,7); place(board,pieces,"Sente","R",7,7);
+      for (let f=0; f<9; f++) place(board,pieces,"Sente","P",f,6);
+      // Gote
+      place(board,pieces,"Gote","L",0,0); place(board,pieces,"Gote","N",1,0); place(board,pieces,"Gote","S",2,0);
+      place(board,pieces,"Gote","G",3,0); place(board,pieces,"Gote","K",4,0); place(board,pieces,"Gote","G",5,0);
+      place(board,pieces,"Gote","S",6,0); place(board,pieces,"Gote","N",7,0); place(board,pieces,"Gote","L",8,0);
+      place(board,pieces,"Gote","B",7,1); place(board,pieces,"Gote","R",1,1);
+      for (let f=0; f<9; f++) place(board,pieces,"Gote","P",f,2);
+
+      return { board, pieces, turn:"Sente", selected:undefined, legalMoves:[],
+               quantumAttempt:false, pendingSplit:undefined,
+               senteHand:{}, goteHand:{}, log:[], ply:1, winner:undefined, message:undefined };
+    };
+
+    const tileOccupiedBy = (s,f,r) => { const id = s.board[r][f].pieceId; return id ? s.pieces[id]?.side : undefined; };
+    const rays=(s,from,side,dirs)=>{const res=[]; for(const {df,dr} of dirs){ let f=from.f+df,r=from.r+dr;
+      while(inside(f,r)){ const occ=tileOccupiedBy(s,f,r); if(!occ){res.push({f,r}); f+=df; r+=dr; continue;} if(occ!==side) res.push({f,r}); break; } } return res; };
+    const goldMoves=(s,p,from)=>{const d=dir(p.side),ds=[{df:0,dr:d},{df:-1,dr:d},{df:1,dr:d},{df:-1,dr:0},{df:1,dr:0},{df:0,dr:-d}],a=[];
+      for(const {df,dr} of ds){const f=from.f+df,r=from.r+dr;if(!inside(f,r))continue;const occ=tileOccupiedBy(s,f,r);if(!occ||occ!==p.side)a.push({f,r});}return a;};
+    const silverMoves=(s,p,from)=>{const d=dir(p.side),ds=[{df:0,dr:d},{df:-1,dr:d},{df:1,dr:d},{df:-1,dr:-d},{df:1,dr:-d}],a=[];
+      for(const {df,dr} of ds){const f=from.f+df,r=from.r+dr;if(!inside(f,r))continue;const occ=tileOccupiedBy(s,f,r);if(!occ||occ!==p.side)a.push({f,r});}return a;};
+    const kingMoves=(s,p,from)=>{const a=[]; for(let df=-1; df<=1; df++) for(let dr=-1; dr<=1; dr++){ if(!df&&!dr) continue;
+      const f=from.f+df,r=from.r+dr; if(!inside(f,r)) continue; const occ=tileOccupiedBy(s,f,r); if(!occ||occ!==p.side) a.push({f,r}); } return a; };
+    const knightMoves=(s,p,from)=>{const d=dir(p.side),js=[{df:-1,dr:2*d},{df:1,dr:2*d}],a=[]; for(const {df,dr} of js){const f=from.f+df,r=from.r+dr;
+      if(!inside(f,r))continue; const occ=tileOccupiedBy(s,f,r); if(!occ||occ!==p.side) a.push({f,r}); } return a; };
+    const lanceRays=(s,p,from)=>rays(s,from,p.side,[{df:0,dr:dir(p.side)}]);
+    const rookRays=(s,p,from)=>rays(s,from,p.side,[{df:1,dr:0},{df:-1,dr:0},{df:0,dr:1},{df:0,dr:-1}]);
+    const bishopRays=(s,p,from)=>rays(s,from,p.side,[{df:1,dr:1},{df:-1,dr:1},{df:1,dr:-1},{df:-1,dr:-1}]);
+    const pawnMoves=(s,p,from)=>{const d=dir(p.side),f=from.f,r=from.r+d,a=[]; if(inside(f,r)){ const occ=tileOccupiedBy(s,f,r); if(!occ||occ!==p.side) a.push({f,r}); } return a; };
+    const promotedMoves=(s,p,from)=>{ if(p.kind==="R"&&p.promoted){const set=new Set([...rookRays(s,p,from),...kingMoves(s,p,from)].map(x=>`${x.f},${x.r}`));
+        return [...set].map(t=>({f:+t.split(",")[0],r:+t.split(",")[1]}));}
+      if(p.kind==="B"&&p.promoted){const set=new Set([...bishopRays(s,p,from),...kingMoves(s,p,from)].map(x=>`${x.f},${x.r}`));
+        return [...set].map(t=>({f:+t.split(",")[0],r:+t.split(",")[1]}));}
+      if(p.promoted&&["S","N","L","P"].includes(p.kind)) return goldMoves(s,p,from);
+      switch(p.kind){case"K":return kingMoves(s,p,from);case"G":return goldMoves(s,p,from);case"S":return silverMoves(s,p,from);
+        case"N":return knightMoves(s,p,from);case"L":return lanceRays(s,p,from);case"R":return rookRays(s,p,from);case"B":return bishopRays(s,p,from);case"P":return pawnMoves(s,p,from);} return []; };
+    const handOf=(s,side)=>side==="Sente"?s.senteHand:s.goteHand;
+    const setHandOf=(s,side,hand)=>{ if(side==="Sente") s.senteHand=hand; else s.goteHand=hand; };
+    const addToHand=(s,side,kind)=>{ const h=handOf(s,side); h[kind]=(h[kind]||0)+1; setHandOf(s,side,{...h}); };
+    const removeFromHand=(s,side,kind)=>{ const h=handOf(s,side); if(!h[kind]) return false; h[kind]-=1; if(h[kind]<=0) delete h[kind]; setHandOf(s,side,{...h}); return true; };
+    const canDropPawnHere_NoNifu=(s,side,f)=>{ for(let r=0;r<9;r++){const id=s.board[r][f].pieceId; if(!id) continue; const p=s.pieces[id]; if(p.side===side && p.kind==="P" && !p.promoted) return false;} return true; };
+    const dropTargets=(s,side,kind)=>{ const t=[]; for(let r=0;r<9;r++) for(let f=0;f<9;f++){ if(s.board[r][f].pieceId) continue;
+        if(kind==="P"){ if(!canDropPawnHere_NoNifu(s,side,f)) continue; if((side==="Sente"&&r===8)||(side==="Gote"&&r===0)) continue; }
+        if(kind==="N"){ if((side==="Sente"&&r>=7)||(side==="Gote"&&r<=1)) continue; }
+        if(kind==="L"){ if((side==="Sente"&&r===8)||(side==="Gote"&&r===0)) continue; }
+        t.push({f,r}); } return t; };
+    const isQuantumEnabled=(p)=>["R","B","G"].includes(p.kind);
+    const coord=(sq)=>`${String.fromCharCode(97+sq.f)}${9-sq.r}`;
+
+    function Game(){
+      const [state,setState]=useState(()=>setupInitial());
+      const reset=()=>setState(setupInitial());
+      const currentHand=state.turn==="Sente"?state.senteHand:state.goteHand;
+
+      const selectFromHand=(kind)=>{ if(state.winner) return; if(!currentHand[kind]) return;
+        setState(s=>({...s,selected:{fromHand:kind,from:undefined,pieceId:undefined},legalMoves:dropTargets(s,s.turn,kind)})); };
+
+      const selectPieceAt=(f,r)=>{ const id=state.board[r][f].pieceId; if(!id) return; const p=state.pieces[id];
+        const from={f,r}; const moves=promotedMoves(state,p,from);
+        setState(s=>({...s,selected:{from,pieceId:id,fromHand:undefined},legalMoves:moves})); };
+
+      const maybePromote=(p,from,to)=>{ const enters=inPromoZone(p.side,to.r)||inPromoZone(p.side,from.r);
+        if(!enters) return false;
+        if(p.kind==="P"||p.kind==="L"){ if((p.side==="Sente"&&to.r===8)||(p.side==="Gote"&&to.r===0)) return true; }
+        if(p.kind==="N"){ if((p.side==="Sente"&&to.r>=7)||(p.side==="Gote"&&to.r<=1)) return true; }
+        if(["R","B","S","N","L","P"].includes(p.kind)) return true; return false; };
+
+      const endTurn=(s,notation)=>{ s.log.push({ply:s.ply,side:s.turn,notation}); s.ply+=1; s.turn=s.turn==="Sente"?"Gote":"Sente";
+        s.selected=undefined; s.legalMoves=[]; s.quantumAttempt=false; s.pendingSplit=undefined; s.message=undefined; };
+
+      const addToHand=(s,side,kind)=>{ const h=side==="Sente"?s.senteHand:s.goteHand; h[kind]=(h[kind]||0)+1; if(side==="Sente") s.senteHand={...h}; else s.goteHand={...h}; };
+
+      const capturePiece=(s,victimId,captor)=>{ const vic=s.pieces[victimId];
+        for(let r=0;r<9;r++) for(let f=0;f<9;f++){ if(s.board[r][f].pieceId===victimId) s.board[r][f].pieceId=undefined; }
+        if(vic.kind==="K"){ s.winner=captor.side; s.message=`${captor.side} captured the King!`; } else { addToHand(s,captor.side,vic.kind); }
+        delete s.pieces[victimId]; };
+
+      const resolveQuantumCapture=(s,targetId)=>{ const coin=Math.random()<0.5?"SUCCESS":"GHOST"; const p=s.pieces[targetId];
+        if(!p) return "SUCCESS"; if(p.quantum?.status!=="split") return "SUCCESS"; return coin; };
+
+      const collapseToOtherBranch=(s,pid,capturedAt)=>{ const p=s.pieces[pid]; if(!p||p.quantum?.status!=="split") return;
+        const [a,b]=p.quantum.branches; const other=(a.f===capturedAt.f && a.r===capturedAt.r)?b:a;
+        for(let r=0;r<9;r++) for(let f=0;f<9;f++){ if(s.board[r][f].pieceId===pid) s.board[r][f].pieceId=undefined; }
+        s.board[other.r][other.f].pieceId=pid; p.quantum={status:"none",origin:other,branches:[other,other]}; };
+
+      const makeMove=(from,to)=>{ const pieceId=state.board[from.r][from.f].pieceId; const p=state.pieces[pieceId]; const ns=deepCopy(state);
+        if(p.quantum?.status==="split"){ for(let r=0;r<9;r++) for(let f=0;f<9;f++){ if(ns.board[r][f].pieceId===pieceId) ns.board[r][f].pieceId=undefined; }
+          ns.board[from.r][from.f].pieceId=pieceId; ns.pieces[pieceId].quantum={status:"none",origin:from,branches:[from,from]}; }
+        const victimId=ns.board[to.r][to.f].pieceId; if(victimId){ const res=resolveQuantumCapture(ns,victimId);
+          if(res==="SUCCESS"){ capturePiece(ns,victimId,ns.pieces[pieceId]); } else { collapseToOtherBranch(ns,victimId,to); } }
+        ns.board[from.r][from.f].pieceId=undefined; const will=maybePromote(ns.pieces[pieceId],from,to);
+        ns.pieces[pieceId].promoted = ns.pieces[pieceId].promoted || will;
+        if(state.quantumAttempt && QE_KINDS.includes(ns.pieces[pieceId].kind)){ const coin=Math.random()<0.5?"HEADS":"TAILS";
+          if(coin==="HEADS"){ ns.board[to.r][to.f].pieceId=pieceId; ns.pieces[pieceId].quantum={status:"none",origin:to,branches:[to,to]};
+            endTurn(ns,`${state.turn}: ${id2str(ns.pieces[pieceId])} to ${coord(to)} (Q coin: HEADS)`); setState(ns); return; }
+          else { ns.board[to.r][to.f].pieceId=pieceId; ns.pieces[pieceId].quantum={status:"none",origin:from,branches:[to,to]};
+            ns.pendingSplit={pieceId,firstDest:to,coin:"TAILS"}; ns.message=`Quantum coin = TAILS. もう一つの移動先を選んでください（${coord(from)} から到達可能・空マス）`; setState(ns); return; } }
+        else { ns.board[to.r][to.f].pieceId=pieceId; ns.pieces[pieceId].quantum={status:"none",origin:to,branches:[to,to]};
+          endTurn(ns,`${state.turn}: ${id2str(ns.pieces[pieceId])} to ${coord(to)}`); setState(ns); return; } };
+
+      const onClickSquare=(f,r)=>{ if(state.winner) return; const sq={f,r};
+        if(state.pendingSplit){ const {pieceId,firstDest,coin}=state.pendingSplit; if(coin==="TAILS"){ const p=state.pieces[pieceId]; if(!p) return;
+            const origin=p.quantum?.origin; const legal=promotedMoves(state,p,origin).filter(s=>!state.board[s.r][s.f].pieceId);
+            if(!legal.some(x=>sqEq(x,sq)) || sqEq(firstDest,sq)) return; const ns=deepCopy(state); const np=ns.pieces[pieceId];
+            ns.board[origin.r][origin.f].pieceId=undefined; ns.board[firstDest.r][firstDest.f].pieceId=pieceId; ns.board[r][f].pieceId=pieceId;
+            np.quantum={status:"split",origin,branches:[firstDest,sq]}; endTurn(ns,`${state.turn}: Q-split to ${coord(firstDest)} & ${coord(sq)}`); setState(ns); return; } }
+        if(state.selected?.fromHand){ const kind=state.selected.fromHand; if(state.legalMoves.some(x=>sqEq(x,sq))){ const ns=deepCopy(state);
+            const id=nid(); const p={id,side:ns.turn,kind,promoted:false,quantum:{status:"none",origin:sq,branches:[sq,sq]}}; ns.pieces[id]=p; ns.board[r][f].pieceId=id;
+            removeFromHand(ns,ns.turn,kind); endTurn(ns,`${ns.turn}: drop ${kind} to ${coord(sq)}`); setState(ns);} return; }
+        const id=state.board[r][f].pieceId; if(state.selected?.pieceId){ const from=state.selected.from;
+          if(!state.legalMoves.some(m=>sqEq(m,sq))){ if(id){ const p2=state.pieces[id]; if(p2.side===state.turn) selectPieceAt(f,r);} return; }
+          makeMove(from,sq); return; }
+        if(id){ const p=state.pieces[id]; if(p.side===state.turn) selectPieceAt(f,r); }
+      };
+
+      const id2str=(p)=>`${p.side==="Sente"?"▲":"△"}${p.promoted?"+":""}${p.kind}`;
+      const onClickHandBg=()=>{ if(state.winner) return; setState(s=>({...s,selected:undefined,legalMoves:[]})); };
+      const toggleQuantum=()=>{ if(state.winner) return; setState(s=>({...s,quantumAttempt:!s.quantumAttempt})); };
+      const pieceLabel=({kind,promoted,side})=>{ const map={K:"玉",R:"飛",B:"角",G:"金",S:"銀",N:"桂",L:"香",P:"歩"}; return `${side==="Sente"?"▲":"△"}${promoted?"成":""}${map[kind]}`; };
+      const tileClass=(f,r)=>{ const isDark=(f+r)%2===1,base=isDark?"bg-amber-200":"bg-amber-100"; const sel=state.selected?.from && sqEq(state.selected.from,{f,r});
+        const legal=state.legalMoves.some(m=>m.f===f&&m.r===r); const hint= sel? "ring-4 ring-indigo-400": (legal? "ring-2 ring-indigo-300": "");
+        return `${base} ${hint} relative w-12 h-12 flex items-center justify-center rounded-md shadow-sm`; };
+      const renderHand=(hand,side)=>{ const entries=Object.entries(hand);
+        return (<div className="flex flex-wrap gap-2 p-2 bg-neutral-100 rounded-xl shadow-inner" onClick={onClickHandBg}>
+          {entries.length===0 && <div className="text-sm text-neutral-500">(なし)</div>}
+          {entries.map(([k,n])=> (<button key={k} className={`px-2 py-1 rounded-lg shadow text-sm border ${state.turn===side?"bg-white hover:bg-neutral-50":"bg-neutral-200"}`}
+            disabled={state.turn!==side} onClick={(e)=>{e.stopPropagation(); selectFromHand(k);}}>{pieceLabel({kind:k,promoted:false,side})}×{n}</button>))}
+        </div>); };
+      const renderPiece=(id)=>{ if(!id) return null; const p=state.pieces[id]; if(!p) return null; const qe=QE_KINDS.includes(p.kind);
+        return (<div className={`text-sm sm:text-base font-semibold select-none ${p.side==="Sente"?"text-rose-700":"text-sky-700"}`}>
+          {pieceLabel({kind:p.kind,promoted:!!p.promoted,side:p.side})}{qe && <span className="ml-1 text-[10px] align-super">Q</span>}
+          {p.quantum?.status==="split" && <span className="ml-1 text-[10px] align-super">ψ</span>}</div>); };
+      const statusText=()=> state.winner? `勝者: ${state.winner}`: `手番: ${state.turn}　${state.quantumAttempt?"（量子試行 ON）":""}`;
+      const legend="量子分岐: 飛・角・金のみ。量子試行ON→TAILSで2地点に同時配置。相手が片方を取ろうとすると50%で幻・50%で実体。";
+
+      return (
+        <div className="w-full min-h-screen p-4 sm:p-6 bg-neutral-50 text-neutral-900">
+          <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-6">
+            <div className="flex flex-col gap-3 items中心">
+              <div className="w-[calc(9*3rem)]">{renderHand(state.goteHand,"Gote")}</div>
+              <div className="grid grid-cols-9 gap-1 p-2 bg-amber-50 rounded-2xl shadow-lg border border-amber-200">
+                {Array.from({length:9}).map((_,r)=> Array.from({length:9}).map((__,f)=>(<button key={`${f},${r}`} className={tileClass(f,r)} onClick={()=>onClickSquare(f,r)} disabled={!!state.winner}>{renderPiece(state.board[r][f].pieceId)}</button>)))}
+              </div>
+              <div className="w-[calc(9*3rem)]">{renderHand(state.senteHand,"Sente")}</div>
+            </div>
+            <div className="flex flex-col gap-4">
+              <div className="p-4 rounded-2xl bg-white shadow border">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-lg font-bold">量子将棋 v1</div>
+                  <button className={`px-3 py-1 rounded-xl border shadow ${state.quantumAttempt?"bg-indigo-600 text-white":"bg-white"}`} onClick={toggleQuantum} disabled={!!state.winner}>量子試行</button>
+                </div>
+                <div className="mt-1 text-sm text-neutral-600">{statusText()}</div>
+                {state.message && <div className="mt-2 text-sm text-indigo-700">{state.message}</div>}
+                <div className="mt-3 text-xs text-neutral-500 leading-relaxed">{legend}</div>
+                <div className="mt-3 flex gap-2"><button className="px-3 py-1 rounded-xl border shadow bg-white hover:bg-neutral-50" onClick={reset}>リセット</button></div>
+              </div>
+              <div className="p-4 rounded-2xl bg-white shadow border">
+                <div className="font-semibold">手駒（先手）</div>
+                <div className="mt-2 text-sm">{Object.entries(state.senteHand).map(([k,v])=>`${k}×${v}`).join("　")||"(なし)"}</div>
+                <div className="mt-3 font-semibold">手駒（後手）</div>
+                <div className="mt-2 text-sm">{Object.entries(state.goteHand).map(([k,v])=>`${k}×${v}`).join("　")||"(なし)"}</div>
+              </div>
+              <div className="p-4 rounded-2xl bg-white shadow border max-h-[50vh] overflow-auto">
+                <div className="font-semibold mb-2">棋譜</div>
+                <ol className="text-sm space-y-1 list-decimal list-inside">{state.log.map((m,i)=>(<li key={i} className="font-mono">{m.notation}</li>))}</ol>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<Game />);
+  </script>
+
+  <!-- PWA: Service Worker 登録 -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js').catch(e => console.error('SW reg error', e));
+      });
+    }
+  </script>
+</body>
+</html>
